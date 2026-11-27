@@ -1,628 +1,578 @@
-
-import json
+import math
 import numpy as np
 import pandas as pd
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+
+st.set_page_config(
+    page_title="GPS Lap Analyzer",
+    page_icon="🏁",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+st.markdown("""
+<style>
+.block-container {
+    padding-top: 1.4rem;
+    padding-bottom: 2rem;
+    max-width: 1500px;
+}
+div[data-testid="stMetric"] {
+    background: rgba(128,128,128,.07);
+    border: 1px solid rgba(128,128,128,.18);
+    padding: 13px 15px;
+    border-radius: 12px;
+}
+div[data-testid="stMetricValue"] {
+    font-size: 1.8rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("🏁 GPS Lap Analyzer")
+st.caption("Análise de voltas e telemetria GPS")
+st.write(
+    "Carregue um CSV do RaceChrono com as voltas já identificadas "
+    "para analisar tempos, velocidades e desempenho."
+)
+
+arquivo = st.file_uploader("Arquivo de telemetria (.csv)", type=["csv"])
+
+if arquivo is None:
+    st.info("Carregue o CSV exportado pelo RaceChrono para começar.")
+    st.stop()
 
 
-def read_csv(file):
-    for encoding in ('utf-8-sig', 'latin1'):
-        for sep in (None, ',', ';', '\t'):
-            try:
-                file.seek(0)
-                d = pd.read_csv(file, encoding=encoding, sep=sep, engine='python')
-                if len(d.columns) > 1:
-                    d.columns = d.columns.str.strip().str.lower()
-                    return d
-            except (ValueError, UnicodeError, pd.errors.ParserError):
-                pass
-    raise ValueError('CSV não reconhecido.')
+# ========================================================
+# LEITURA DO CSV
+# ========================================================
 
+df = None
+erro_leitura = None
 
-def prepare(d, laps=None, meta=None):
-    d = d.copy()
-    meta = meta or {}
-
-    aliases = {
-        'lat': ['latitude_decimal', 'latitude', 'lat'],
-        'lon': ['longitude_decimal', 'longitude', 'lon', 'lng'],
-        'lap': ['volta_associada', 'lap', 'lap_number', 'lapnumber', 'volta', 'numero_volta'],
-        'speed': ['velocidade_kmh', 'speed_kmh', 'speed (km/h)']
-    }
-
-    for target, names in aliases.items():
-        col = next((n for n in names if n in d), None)
-        if col:
-            d[target] = pd.to_numeric(d[col], errors='coerce')
-
-    if not {'lat', 'lon', 'lap'} <= set(d):
-        raise ValueError('CSV precisa de latitude, longitude e número de volta.')
-
-    col = next((n for n in [
-        'timestamp_ms', 'timestamp_ms_bruto', 'segundos_desde_inicio',
-        'timestamp', 'time', 'tempo'
-    ] if n in d), None)
-
-    if col is None:
-        raise ValueError('Coluna de tempo não encontrada.')
-
-    d['t'] = pd.to_numeric(d[col], errors='coerce') / (
-        1000 if col.endswith('_ms') or col == 'timestamp_ms_bruto' else 1
-    )
-
-    if col not in ('timestamp_ms', 'timestamp_ms_bruto') and laps is not None:
-        if col == 'segundos_desde_inicio' and 'startedTimestampMs' in meta:
-            d['t'] += meta['startedTimestampMs'] / 1000
-        else:
-            raise ValueError(
-                'Para usar laps.json, é necessário timestamp_ms ou '
-                'segundos_desde_inicio com metadata.json.'
+for encoding in ("utf-8-sig", "utf-8", "latin1"):
+    for sep in (None, ",", ";", "\t"):
+        try:
+            arquivo.seek(0)
+            tentativa = pd.read_csv(
+                arquivo,
+                encoding=encoding,
+                sep=sep,
+                engine="python" if sep is None else "c"
             )
+            if len(tentativa.columns) > 1:
+                df = tentativa
+                break
+        except Exception as e:
+            erro_leitura = e
+    if df is not None:
+        break
 
-    d = d.dropna(subset=['lat', 'lon', 't']).sort_values('t').drop_duplicates('t')
-    d = d[d.lat.between(-90, 90) & d.lon.between(-180, 180)].copy()
+if df is None:
+    st.error(f"Não foi possível ler o CSV: {erro_leitura}")
+    st.stop()
 
-    if 'fix_quality' in d:
-        d = d[pd.to_numeric(d.fix_quality, errors='coerce') > 0].copy()
+df.columns = [str(c).strip() for c in df.columns]
 
-    if d.empty:
-        raise ValueError('Sem amostras GPS válidas.')
 
-    official = laps is not None
+def localizar_coluna(opcoes):
+    mapa = {str(c).strip().lower(): c for c in df.columns}
+    return next((mapa[n.lower()] for n in opcoes if n.lower() in mapa), None)
 
-    # RaceMetrics: cada volta concluída é confirmada pela volta seguinte.
-    # A última volta em andamento nunca entra no ranking.
-    if laps is None and {'ultima_volta_s', 'tempo_volta_s'} <= set(d):
-        laps = []
 
-        groups = {
-            int(n): g
-            for n, g in d.dropna(subset=['lap']).groupby('lap')
-            if n >= 0 and n == int(n)
-        }
+lat_col = localizar_coluna(["latitude_decimal", "latitude", "lat"])
+lon_col = localizar_coluna(["longitude_decimal", "longitude", "lon", "lng"])
+tempo_col = localizar_coluna([
+    "segundos_desde_inicio",
+    "timestamp_ms_bruto",
+    "timestamp",
+    "time",
+    "tempo"
+])
+volta_col = localizar_coluna([
+    "volta_associada",
+    "lap",
+    "lap_number",
+    "lapnumber",
+    "volta",
+    "numero_volta"
+])
 
-        for n, g in sorted(groups.items()):
-            if n <= 0 or n + 1 not in groups:
-                continue
+if lat_col is None or lon_col is None:
+    st.error("Não encontrei as colunas de latitude e longitude.")
+    st.write("Colunas disponíveis:", list(df.columns))
+    st.stop()
 
-            following = groups[n + 1]
-            durations = pd.to_numeric(
-                following['ultima_volta_s'], errors='coerce'
-            ).dropna()
-            durations = durations[durations > 0]
+if volta_col is None:
+    st.error(
+        "Não encontrei a coluna que identifica as voltas. "
+        "Este analisador espera a coluna 'volta_associada' "
+        "ou uma coluna equivalente no CSV."
+    )
+    st.write("Colunas disponíveis:", list(df.columns))
+    st.stop()
 
-            if durations.empty:
-                continue
+df[lat_col] = pd.to_numeric(df[lat_col], errors="coerce")
+df[lon_col] = pd.to_numeric(df[lon_col], errors="coerce")
+df[volta_col] = pd.to_numeric(df[volta_col], errors="coerce")
 
-            duration = float(durations.mode().iloc[0])
+if tempo_col is None:
+    st.error("Não encontrei uma coluna de tempo no CSV.")
+    st.stop()
 
-            starts = (
-                g.t - pd.to_numeric(g['tempo_volta_s'], errors='coerce')
-            ).dropna()
+tempo_valores = pd.to_numeric(df[tempo_col], errors="coerce")
+if str(tempo_col).lower() == "timestamp_ms_bruto":
+    df["_tempo_s"] = tempo_valores / 1000.0
+else:
+    df["_tempo_s"] = tempo_valores
 
-            if starts.empty:
-                continue
+df = df.dropna(subset=[lat_col, lon_col, "_tempo_s"]).copy()
+df = df[
+    df[lat_col].between(-90, 90)
+    & df[lon_col].between(-180, 180)
+].copy()
 
-            a = float(starts.median())
-            start_ms = round(a * 1000)
-            duration_ms = round(duration * 1000)
+if df.empty:
+    st.error("O CSV não contém coordenadas GPS e tempos válidos.")
+    st.stop()
 
-            laps.append(dict(
-                number=n,
-                startTimestampMs=start_ms,
-                endTimestampMs=start_ms + duration_ms,
-                durationMs=duration_ms,
-                valid=True
-            ))
+df = df.sort_values("_tempo_s").reset_index(drop=True)
 
-        official = True
+# Apenas registros associados a uma volta são usados na análise.
+df_voltas = df.dropna(subset=[volta_col]).copy()
 
-    records = []
-    traces = {}
+if df_voltas.empty:
+    st.error(
+        f"A coluna '{volta_col}' existe, mas não possui números de volta válidos."
+    )
+    st.stop()
 
-    if official:
-        if not isinstance(laps, list):
-            raise ValueError('laps.json deve conter uma lista de voltas.')
+df_voltas[volta_col] = df_voltas[volta_col].astype(int)
 
-        for r in laps:
-            if r.get('valid') is not True:
-                continue
 
-            n = int(r['number'])
-            a = r['startTimestampMs'] / 1000
-            b = r['endTimestampMs'] / 1000
-            duration = r['durationMs'] / 1000
+# ========================================================
+# PREPARAÇÃO DOS DADOS DE CADA VOLTA
+# ========================================================
 
-            if n <= 0 or b <= a or duration <= 0:
-                continue
+def distancia_metros(lat1, lon1, lat2, lon2):
+    """Calcula a distância entre dois pontos GPS usando Haversine."""
+    raio_terra = 6371000.0
+    lat1, lon1, lat2, lon2 = map(
+        math.radians, (lat1, lon1, lat2, lon2)
+    )
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    )
+    return 2 * raio_terra * math.asin(min(1.0, math.sqrt(a)))
 
-            if abs((b - a) - duration) > 0.005:
-                raise ValueError(f'Tempo inconsistente na volta {n}.')
 
-            records.append((n, a, b, duration))
+def preparar_dados_volta(numero_volta):
+    dados = df_voltas[df_voltas[volta_col] == int(numero_volta)].copy()
+    dados = dados.sort_values("_tempo_s").drop_duplicates("_tempo_s")
+    if len(dados) < 2:
+        return None
 
-    else:
-        for n, g in d[(d.lap > 0) & (d.lap < d.lap.max())].groupby('lap'):
-            if len(g) >= 2:
-                records.append((
-                    int(n), g.t.min(), g.t.max(), g.t.max() - g.t.min()
-                ))
+    latitudes = np.radians(dados[lat_col].to_numpy(dtype=float))
+    longitudes = np.radians(dados[lon_col].to_numpy(dtype=float))
 
-    for n, a, b, duration in records:
-        if official:
-            g = d[(d.t >= a) & (d.t <= b)].copy()
+    dlat = np.diff(latitudes)
+    dlon = np.diff(longitudes)
 
-            # Interpolar somente limites cercados por amostras,
-            # sem extrapolar.
-            for boundary in (a, b):
-                if not (d.t == boundary).any() and d.t.min() < boundary < d.t.max():
-                    k = np.searchsorted(d.t.to_numpy(), boundary)
-                    left = d.iloc[k - 1]
-                    right = d.iloc[k]
-
-                    if right.t - left.t > 5:
-                        continue
-
-                    row = {'t': boundary}
-
-                    for c in [
-                        'lat', 'lon', 'speed', 'roll_deg',
-                        'pitch_deg', 'yaw_deg', 'altitude_m'
-                    ]:
-                        if c in d:
-                            x, y = pd.to_numeric(
-                                pd.Series([left[c], right[c]]),
-                                errors='coerce'
-                            )
-                            row[c] = x + (y - x) * (
-                                boundary - left.t
-                            ) / (right.t - left.t)
-
-                    g = pd.concat(
-                        [g, pd.DataFrame([row])],
-                        ignore_index=True
-                    )
-        else:
-            g = d[d.lap == n].copy()
-
-        g = g.sort_values('t').drop_duplicates('t')
-
-        if len(g) < 2:
-            continue
-
-        lat = np.radians(g.lat.to_numpy())
-        lon = np.radians(g.lon.to_numpy())
-
-        h = (
-            np.sin(np.diff(lat) / 2) ** 2
-            + np.cos(lat[:-1]) * np.cos(lat[1:])
-            * np.sin(np.diff(lon) / 2) ** 2
-        )
-
-        ds = 2 * 6371000 * np.arcsin(np.sqrt(np.clip(h, 0, 1)))
-
-        g['distance'] = np.r_[0, np.cumsum(ds)]
-        g['elapsed'] = g.t - a
-
-        if 'speed' not in g:
-            g['speed'] = np.r_[np.nan, ds / np.diff(g.t) * 3.6]
-
-        g['speed'] = g.speed.where(g.speed.between(0, 500))
-
-        traces[n] = g
-
-    table = pd.DataFrame(
-        records,
-        columns=['Volta', 'inicio', 'fim', 'Tempo (s)']
+    a = (
+        np.sin(dlat / 2) ** 2
+        + np.cos(latitudes[:-1]) * np.cos(latitudes[1:])
+        * np.sin(dlon / 2) ** 2
     )
 
-    if table.empty:
-        raise ValueError('Nenhuma volta disponível.')
-
-    table = table.sort_values('Volta').reset_index(drop=True)
-
-    table['Máxima (km/h)'] = [
-        traces[n].speed.max() if n in traces else np.nan
-        for n in table.Volta
-    ]
-
-    table['Média amostral (km/h)'] = [
-        traces[n].speed.mean() if n in traces else np.nan
-        for n in table.Volta
-    ]
-
-    table['Delta (s)'] = table['Tempo (s)'] - table['Tempo (s)'].min()
-
-    return d, table, traces, official
-
-
-def main():
-    st.set_page_config(
-        page_title='RaceMetrics | Lap Analyzer',
-        page_icon='🏁',
-        layout='wide'
+    segmentos = (
+        2 * 6371000.0
+        * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
     )
 
-    st.title('🏁 RaceMetrics | Lap Analyzer')
-    st.caption('Telemetria real • comparação de voltas • análise de desempenho')
-
-    c1, c2, c3 = st.columns(3)
-
-    csv = c1.file_uploader('telemetry.csv', type='csv')
-    lf = c2.file_uploader('laps.json (opcional)', type='json')
-    mf = c3.file_uploader('metadata.json (opcional)', type='json')
-
-    if csv is None:
-        st.info('Carregue os arquivos exportados pelo RaceMetrics. CSV legado também é aceito.')
-        return
-
-    try:
-        raw = read_csv(csv)
-        meta = json.load(mf) if mf else {}
-        laps = json.load(lf) if lf else None
-
-        d, table, traces, official = prepare(raw, laps, meta)
-
-    except (ValueError, KeyError, TypeError) as e:
-        st.error(str(e))
-        return
-
-    best = int(table.loc[table['Tempo (s)'].idxmin(), 'Volta'])
-    bt = table['Tempo (s)'].min()
-
-    if not official:
-        st.warning(
-            'CSV genérico: tempos estimados. Volta 0 e última volta '
-            'excluídas por precaução; sem confirmação de conclusão.'
-        )
-    else:
-        st.success(
-            'Tempos oficiais importados de laps.json; somente voltas marcadas como válidas.'
-            if lf else
-            'Tempos recuperados de ultima_volta_s do CSV RaceMetrics; '
-            'somente voltas com conclusão confirmada.'
-        )
-
-        if meta.get('lapCount') is not None and meta['lapCount'] != len(table):
-            st.warning('Quantidade de voltas diverge dos metadados.')
-
-        if meta.get('bestLapTimeMs') is not None and abs(
-            meta['bestLapTimeMs'] / 1000 - bt
-        ) > 0.001:
-            st.warning('Melhor tempo diverge dos metadados.')
-
-    st.caption(
-        f"Pista: {meta.get('track', 'Não informada')} | "
-        f"Sessão: {meta.get('id', 'CSV')} | "
-        f"Velocidade: {'registrada pelo dispositivo' if 'speed' in d else 'estimada pelas coordenadas GPS'}"
+    dados["Distância (m)"] = np.concatenate(([0.0], np.cumsum(segmentos)))
+    dados["Tempo decorrido (s)"] = (
+        dados["_tempo_s"] - dados["_tempo_s"].iloc[0]
     )
 
-    a, b, c, e = st.columns(4)
-
-    a.metric('Melhor volta', f'{bt:.3f} s', f'V{best}', delta_color='off')
-    b.metric('Voltas', len(table))
-    c.metric('Amostras válidas', len(d))
-
-    e.metric(
-        'Velocidade máxima',
-        f'{d.speed.max():.2f} km/h'
-        if 'speed' in d else
-        f"{table['Máxima (km/h)'].max():.2f} km/h"
+    dt = dados["_tempo_s"].diff().to_numpy(dtype=float)
+    ds = np.concatenate(([np.nan], segmentos))
+    velocidade = np.divide(
+        ds * 3.6,
+        dt,
+        out=np.full(len(dados), np.nan),
+        where=dt > 0
     )
+    velocidade[velocidade > 500] = np.nan
+    dados["Velocidade (km/h)"] = velocidade
 
-    # Histórico de voltas
-    st.subheader('Histórico de voltas')
+    return dados
 
+
+# ========================================================
+# HISTÓRICO E TEMPOS DAS VOLTAS
+# ========================================================
+
+st.divider()
+st.subheader("1. Histórico de voltas")
+
+registros = []
+
+for numero in sorted(df_voltas[volta_col].unique()):
+    dados = df_voltas[df_voltas[volta_col] == numero].sort_values("_tempo_s")
+    if len(dados) < 2:
+        continue
+
+    inicio = float(dados["_tempo_s"].iloc[0])
+    fim = float(dados["_tempo_s"].iloc[-1])
+    duracao = fim - inicio
+
+    if duracao > 0:
+        registros.append({
+            "Volta": int(numero),
+            "Início (s)": inicio,
+            "Fim (s)": fim,
+            "Tempo da volta (s)": duracao,
+            "Registros GPS": len(dados)
+        })
+
+if not registros:
+    st.error("Não há voltas com pelo menos dois registros GPS e tempo válido.")
+    st.stop()
+
+tabela = pd.DataFrame(registros).sort_values("Volta").reset_index(drop=True)
+
+idx_melhor = tabela["Tempo da volta (s)"].idxmin()
+numero_volta_mais_rapida = int(tabela.loc[idx_melhor, "Volta"])
+tempo_mais_rapido = float(tabela.loc[idx_melhor, "Tempo da volta (s)"])
+
+tabela["Diferença para anterior (s)"] = tabela["Tempo da volta (s)"].diff()
+tabela["Diferença para mais rápida (s)"] = (
+    tabela["Tempo da volta (s)"] - tempo_mais_rapido
+)
+
+tabela_exibicao = tabela.copy()
+for coluna in [
+    "Início (s)", "Fim (s)", "Tempo da volta (s)",
+    "Diferença para anterior (s)", "Diferença para mais rápida (s)"
+]:
+    tabela_exibicao[coluna] = tabela_exibicao[coluna].round(3)
+
+
+def destacar_melhor_volta(linha):
+    if int(linha["Volta"]) == numero_volta_mais_rapida:
+        return [
+            "background-color:#d8f3dc;color:#173b25;font-weight:bold"
+        ] * len(linha)
+    return [""] * len(linha)
+
+
+st.success(
+    f"🏆 Melhor volta: Volta {numero_volta_mais_rapida} "
+    f"· {tempo_mais_rapido:.3f} s"
+)
+
+with st.expander("Tabela completa de voltas", expanded=True):
     st.dataframe(
-        table.drop(columns=['inicio', 'fim']).round(3),
-        hide_index=True,
-        use_container_width=True
+        tabela_exibicao.style.apply(destacar_melhor_volta, axis=1),
+        use_container_width=True,
+        hide_index=True
     )
 
-    # Gráfico de tempo por volta em linhas
-    st.plotly_chart(
-        go.Figure(
-            go.Scatter(
-                x=table.Volta.astype(str),
-                y=table['Tempo (s)'],
-                mode='lines+markers',
-                line=dict(color='#00d084', width=3),
-                marker=dict(
-                    size=9,
-                    color=[
-                        '#00d084' if n == best else '#64748b'
-                        for n in table.Volta
-                    ]
-                )
+with st.expander("Evolução dos tempos por volta"):
+    st.line_chart(
+        tabela.set_index("Volta")["Tempo da volta (s)"],
+        x_label="Volta",
+        y_label="Tempo (s)"
+    )
+
+
+# ========================================================
+# ANÁLISE DA VOLTA SELECIONADA
+# ========================================================
+
+st.divider()
+st.subheader("2. Análise de desempenho")
+
+voltas_disponiveis = tabela["Volta"].astype(int).tolist()
+
+volta_selecionada = st.selectbox(
+    "Selecione a volta para analisar",
+    voltas_disponiveis,
+    format_func=lambda v: (
+        f"Volta {v} 🏆 (melhor)"
+        if v == numero_volta_mais_rapida else f"Volta {v}"
+    ),
+    key="seletor_volta"
+)
+
+linha_selecionada = tabela[tabela["Volta"] == volta_selecionada].iloc[0]
+tempo_volta = float(linha_selecionada["Tempo da volta (s)"])
+dados_atual = preparar_dados_volta(volta_selecionada)
+dados_melhor = preparar_dados_volta(numero_volta_mais_rapida)
+
+diferenca = tempo_volta - tempo_mais_rapido
+valor_diff = (
+    "0,000 s" if volta_selecionada == numero_volta_mais_rapida
+    else f"+{diferenca:.3f} s"
+)
+
+m1, m2, m3 = st.columns([1.2, 1, 1])
+m1.metric(f"Tempo da volta {volta_selecionada}", f"{tempo_volta:.3f} s")
+m2.metric("Diferença para a melhor", valor_diff)
+m3.metric("Melhor volta", f"{tempo_mais_rapido:.3f} s",
+          f"Volta {numero_volta_mais_rapida}")
+
+
+# ========================================================
+# VELOCIDADE POR DISTÂNCIA
+# ========================================================
+
+st.markdown("### Velocidade por distância")
+st.caption(
+    "Compare a velocidade da volta selecionada com a melhor volta "
+    "ao longo da distância percorrida."
+)
+
+if dados_atual is not None and dados_melhor is not None:
+    atual = dados_atual.dropna(subset=["Velocidade (km/h)"]).sort_values("Distância (m)")
+    melhor = dados_melhor.dropna(subset=["Velocidade (km/h)"]).sort_values("Distância (m)")
+
+    if not atual.empty and not melhor.empty:
+        dist_max = min(
+            float(atual["Distância (m)"].max()),
+            float(melhor["Distância (m)"].max())
+        )
+
+        if dist_max > 0:
+            max_a = float(atual["Velocidade (km/h)"].max())
+            max_m = float(melhor["Velocidade (km/h)"].max())
+
+            tempo_a = float(
+                dados_atual["_tempo_s"].iloc[-1] - dados_atual["_tempo_s"].iloc[0]
             )
-        ).update_layout(
-            xaxis_title='Volta',
-            yaxis_title='Tempo (s)',
-            height=320
-        ),
-        use_container_width=True
-    )
+            tempo_m = float(
+                dados_melhor["_tempo_s"].iloc[-1] - dados_melhor["_tempo_s"].iloc[0]
+            )
 
-    choices = [
-        int(n) for n in table.Volta
-        if n in traces
+            media_a = (
+                float(dados_atual["Distância (m)"].iloc[-1]) * 3.6 / tempo_a
+                if tempo_a > 0 else float("nan")
+            )
+            media_m = (
+                float(dados_melhor["Distância (m)"].iloc[-1]) * 3.6 / tempo_m
+                if tempo_m > 0 else float("nan")
+            )
+
+            v1, v2, v3, v4 = st.columns(4)
+            v1.metric("Máxima · selecionada", f"{max_a:.1f} km/h")
+            v2.metric("Média GPS · selecionada", f"{media_a:.1f} km/h")
+            v3.metric("Máxima · melhor volta", f"{max_m:.1f} km/h")
+            v4.metric("Média GPS · melhor volta", f"{media_m:.1f} km/h")
+
+            distancia = np.linspace(0, dist_max, 200)
+            da = atual["Distância (m)"].to_numpy(dtype=float)
+            va = atual["Velocidade (km/h)"].to_numpy(dtype=float)
+            dm = melhor["Distância (m)"].to_numpy(dtype=float)
+            vm = melhor["Velocidade (km/h)"].to_numpy(dtype=float)
+
+            da_u, ia = np.unique(da, return_index=True)
+            dm_u, im = np.unique(dm, return_index=True)
+
+            chart = pd.DataFrame({
+                "Distância (m)": distancia,
+                f"Volta {int(volta_selecionada)}": np.interp(distancia, da_u, va[ia]),
+                f"Melhor volta {numero_volta_mais_rapida}": np.interp(distancia, dm_u, vm[im])
+            })
+
+            st.line_chart(
+                chart.set_index("Distância (m)"),
+                x_label="Distância (m)",
+                y_label="Velocidade (km/h)"
+            )
+        else:
+            st.info("Não há distância comum suficiente para comparar as voltas.")
+    else:
+        st.info("Não há registros de velocidade suficientes para comparar as voltas.")
+else:
+    st.info("Não foi possível calcular os dados GPS de uma das voltas.")
+
+
+# ========================================================
+# DIFERENÇA ACUMULADA PARA A MELHOR VOLTA
+# ========================================================
+
+st.markdown("### Diferença acumulada para a melhor volta")
+
+if volta_selecionada == numero_volta_mais_rapida:
+    st.info("Esta é a melhor volta; a diferença em relação a ela é zero.")
+
+elif dados_atual is not None and dados_melhor is not None:
+    da = dados_atual["Distância (m)"].to_numpy(dtype=float)
+    ta = dados_atual["Tempo decorrido (s)"].to_numpy(dtype=float)
+    dm = dados_melhor["Distância (m)"].to_numpy(dtype=float)
+    tm = dados_melhor["Tempo decorrido (s)"].to_numpy(dtype=float)
+
+    oa = np.argsort(da)
+    om = np.argsort(dm)
+    da, ta = da[oa], ta[oa]
+    dm, tm = dm[om], tm[om]
+
+    dau, ia = np.unique(da, return_index=True)
+    dmu, im = np.unique(dm, return_index=True)
+    tau = ta[ia]
+    tmu = tm[im]
+
+    distancia_comum = min(float(dau[-1]), float(dmu[-1]))
+
+    if distancia_comum > 0:
+        distancia = np.linspace(0, distancia_comum, 101)
+        gap = (
+            np.interp(distancia, dau, tau)
+            - np.interp(distancia, dmu, tmu)
+        )
+
+        gap_df = pd.DataFrame({
+            "Distância (m)": distancia.round(1),
+            "Diferença (s)": gap.round(3)
+        })
+
+        st.line_chart(
+            gap_df.set_index("Distância (m)")["Diferença (s)"],
+            x_label="Distância (m)",
+            y_label="Diferença (s)"
+        )
+        st.caption(
+            "Gap positivo = a volta selecionada está atrás da melhor. "
+            "Gap negativo = está à frente."
+        )
+    else:
+        st.info("Não foi possível comparar as distâncias destas voltas.")
+else:
+    st.info("Não há registros GPS suficientes para comparar esta volta com a melhor.")
+
+
+# ========================================================
+# MAPA DE VELOCIDADE POR TRECHO
+# ========================================================
+
+st.divider()
+st.markdown("### Mapa de velocidade por trecho")
+st.caption("Passe o mouse sobre um trecho para ver velocidade, distância e intervalo de tempo.")
+
+if dados_atual is None or len(dados_atual) < 2:
+    st.warning("Não há registros GPS suficientes nesta volta para desenhar o trajeto.")
+else:
+    dados_gps = dados_atual.reset_index(drop=True)
+    trajeto_volta = [
+        [float(lat), float(lon)]
+        for lat, lon in zip(dados_gps[lat_col], dados_gps[lon_col])
     ]
 
-    if best not in choices:
-        st.warning('Melhor volta sem telemetria suficiente.')
-        return
+    centro = [
+        sum(p[i] for p in trajeto_volta) / len(trajeto_volta)
+        for i in (0, 1)
+    ]
 
-    other = [n for n in choices if n != best]
-
-    st.subheader('Comparação de telemetria — estilo F1')
-
-    selected = st.selectbox(
-        'Comparar melhor volta com',
-        other or [best],
-        format_func=lambda n: f'Volta {n}'
-    )
-
-    mode = st.radio(
-        'Eixo horizontal',
-        ['Distância (m)', 'Progresso da volta (%)'],
-        horizontal=True
-    )
-
-    ref = traces[best]
-    comp = traces[selected]
-
-    def axis(g):
-        x = g.distance.to_numpy()
-
-        return (
-            x if mode == 'Distância (m)'
-            else x / x[-1] * 100 if x[-1] > 0
-            else x
-        )
-
-    fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        row_heights=[.72, .28],
-        vertical_spacing=.08
-    )
-
-    for n, g, color in [
-        (best, ref, '#00d084'),
-        (selected, comp, '#ff664d')
-    ]:
-        if n == best and color == '#ff664d':
-            continue
-
-        duration = table.loc[
-            table.Volta == n, 'Tempo (s)'
-        ].iloc[0]
-
-        fig.add_trace(
-            go.Scatter(
-                x=axis(g),
-                y=g.speed,
-                name=f'V{n} · {duration:.3f} s',
-                mode='lines+markers',
-                marker_size=3,
-                line=dict(color=color, width=2.5)
-            ),
-            row=1,
-            col=1
-        )
-
-    x1, x2 = axis(ref), axis(comp)
-
-    u1, i1 = np.unique(x1, return_index=True)
-    u2, i2 = np.unique(x2, return_index=True)
-
-    if min(u1[-1], u2[-1]) > 0:
-        x = np.linspace(0, min(u1[-1], u2[-1]), 200)
-
-        delta = (
-            np.interp(x, u2, comp.elapsed.to_numpy()[i2])
-            - np.interp(x, u1, ref.elapsed.to_numpy()[i1])
-        )
-
-        fig.add_trace(
-            go.Scatter(
-                x=x,
-                y=delta,
-                name='Delta acumulado',
-                line=dict(color='#60a5fa')
-            ),
-            row=2,
-            col=1
-        )
-
-    fig.add_hline(y=0, row=2, col=1, line_dash='dot')
-
-    fig.update_yaxes(title_text='km/h', row=1, col=1)
-    fig.update_yaxes(title_text='Delta (s)', row=2, col=1)
-    fig.update_xaxes(title_text=mode, row=2, col=1)
-
-    fig.update_layout(
-        height=600,
-        hovermode='x unified',
-        legend=dict(orientation='h', y=1.08)
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    gap = (
-        table.loc[table.Volta == selected, 'Tempo (s)'].iloc[0]
-        - bt
-    )
-
-    st.metric(
-        'Diferença oficial de tempo' if official else 'Diferença estimada',
-        f'+{gap:.3f} s'
-    )
-
-    st.caption(
-        'Delta positivo: volta comparada atrás da referência. '
-        'Distância acumulada por GPS é aproximada; curvas podem não '
-        'representar exatamente o mesmo ponto físico. Limites '
-        'interpolados quando há amostras adjacentes; não há extrapolação. '
-        'Progresso normalizado também é aproximado.'
-    )
-
-    # Mapa da volta selecionada
-    st.subheader('Mapa da volta selecionada')
-
-    g = comp
-    points = g[['lat', 'lon']].values.tolist()
-
-    m = folium.Map(
-        location=points[0],
+    mapa_volta = folium.Map(
+        location=centro,
         zoom_start=16,
         control_scale=True
     )
 
-    for i in range(1, len(g)):
-        v = g.speed.iloc[i]
+    folium.PolyLine(
+        trajeto_volta,
+        color="#2563eb",
+        weight=3,
+        opacity=0.25,
+        tooltip="Trajeto da volta"
+    ).add_to(mapa_volta)
 
-        color = (
-            '#888888' if pd.isna(v)
-            else '#2563eb' if v < 30
-            else '#16a34a' if v < 60
-            else '#eab308' if v < 90
-            else '#ef4444'
+    def cor_velocidade(v):
+        if pd.isna(v):
+            return "#808080"
+        if v < 30:
+            return "#0066FF"
+        if v < 60:
+            return "#00AA00"
+        if v < 90:
+            return "#CCCC00"
+        if v < 120:
+            return "#FF8800"
+        return "#FF0000"
+
+    for i in range(1, len(dados_gps)):
+        anterior = dados_gps.iloc[i - 1]
+        atual = dados_gps.iloc[i]
+
+        lat1, lon1 = float(anterior[lat_col]), float(anterior[lon_col])
+        lat2, lon2 = float(atual[lat_col]), float(atual[lon_col])
+        t1, t2 = float(anterior["_tempo_s"]), float(atual["_tempo_s"])
+        dt = t2 - t1
+
+        distancia_trecho = distancia_metros(lat1, lon1, lat2, lon2)
+        velocidade = (
+            distancia_trecho / dt * 3.6 if dt > 0 else float("nan")
+        )
+        if velocidade > 500:
+            velocidade = float("nan")
+
+        cor = cor_velocidade(velocidade)
+        texto = (
+            f"Velocidade: {velocidade:.1f} km/h"
+            if pd.notna(velocidade) else "Velocidade indisponível"
         )
 
         folium.PolyLine(
-            points[i - 1:i + 1],
-            color=color,
-            weight=5,
-            tooltip=f'{v:.1f} km/h' if pd.notna(v) else 'Sem velocidade'
-        ).add_to(m)
+            [[lat1, lon1], [lat2, lon2]],
+            color=cor,
+            weight=6,
+            opacity=0.95,
+            tooltip=(
+                f"Trecho {i}: {texto} | "
+                f"Distância: {distancia_trecho:.1f} m | "
+                f"Intervalo: {dt:.2f} s"
+            )
+        ).add_to(mapa_volta)
 
-    track = meta.get('trackSnapshot', {})
+    folium.Marker(
+        trajeto_volta[0],
+        tooltip="Início da volta",
+        icon=folium.Icon(color="green", icon="play")
+    ).add_to(mapa_volta)
 
-    if all(k in track for k in ('latA', 'lonA', 'latB', 'lonB')):
-        folium.PolyLine(
-            [
-                [track['latA'], track['lonA']],
-                [track['latB'], track['lonB']]
-            ],
-            color='black',
-            weight=5,
-            tooltip='Linha de chegada'
-        ).add_to(m)
+    folium.Marker(
+        trajeto_volta[-1],
+        tooltip="Fim da volta",
+        icon=folium.Icon(color="red", icon="stop")
+    ).add_to(mapa_volta)
 
-    m.fit_bounds(points)
+    legenda = """
+    <div style="
+        position:fixed; bottom:25px; left:25px; z-index:9999;
+        background:#fff; border:1px solid #aaa; border-radius:8px;
+        padding:9px 11px; font-size:12px; color:#222;
+        box-shadow:0 1px 5px #0003; line-height:1.5;">
+        <b>Velocidade (km/h)</b><br>
+        <span style="color:#06f;">━━</span> &lt; 30<br>
+        <span style="color:#0a0;">━━</span> 30–60<br>
+        <span style="color:#cc0;">━━</span> 60–90<br>
+        <span style="color:#f80;">━━</span> 90–120<br>
+        <span style="color:#f00;">━━</span> ≥ 120<br>
+        <span style="color:#888;">━━</span> Sem dado válido
+    </div>
+    """
+    mapa_volta.get_root().html.add_child(folium.Element(legenda))
+    mapa_volta.fit_bounds(trajeto_volta)
 
     st_folium(
-        m,
-        height=450,
+        mapa_volta,
+        height=520,
         use_container_width=True,
-        returned_objects=[]
+        returned_objects=[],
+        key=f"mapa_volta_velocidade_{int(volta_selecionada)}"
     )
-
-    st.caption(
-        'Azul: <30 km/h | Verde: 30–60 | Amarelo: 60–90 | '
-        'Vermelho: ≥90. Mapa-base depende de internet.'
-    )
-
-    # Sensores e qualidade GPS
-    st.subheader('Sensores e qualidade GPS')
-
-    sensores = {
-        'roll_deg': {
-            'nome': 'Roll - Inclinação lateral',
-            'unidade': 'Graus (°)',
-            'explicacao': (
-                'Mede a inclinação lateral do veículo. Durante as curvas, '
-                'pode variar devido à transferência de peso e à inclinação '
-                'do veículo. Mudanças bruscas podem indicar curvas mais '
-                'agressivas ou irregularidades na pista.'
-            )
-        },
-        'pitch_deg': {
-            'nome': 'Pitch - Inclinação longitudinal',
-            'unidade': 'Graus (°)',
-            'explicacao': (
-                'Mede a inclinação do veículo para frente ou para trás. '
-                'Pode variar durante acelerações, frenagens, subidas, '
-                'descidas e irregularidades do terreno.'
-            )
-        },
-        'yaw_deg': {
-            'nome': 'Yaw - Orientação e rotação',
-            'unidade': 'Graus (°)',
-            'explicacao': (
-                'Representa a orientação ou rotação do veículo em torno '
-                'do eixo vertical. Varia durante curvas e mudanças de '
-                'direção. Oscilações podem indicar mudanças rápidas '
-                'de trajetória.'
-            )
-        },
-        'altitude_m': {
-            'nome': 'Altitude',
-            'unidade': 'Metros (m)',
-            'explicacao': (
-                'Indica a altitude estimada pelo GPS. Pode mostrar '
-                'subidas e descidas da pista, mas também sofre influência '
-                'da precisão do sinal GPS.'
-            )
-        },
-        'hdop': {
-            'nome': 'HDOP - Precisão horizontal do GPS',
-            'unidade': 'Índice HDOP',
-            'explicacao': (
-                'Indica a qualidade da geometria dos satélites para '
-                'determinar a posição horizontal. Quanto menor o HDOP, '
-                'melhor tende a ser a precisão. Valores altos indicam '
-                'maior possibilidade de erro na localização.'
-            )
-        },
-        'satelites': {
-            'nome': 'Satélites GPS',
-            'unidade': 'Quantidade',
-            'explicacao': (
-                'Mostra a quantidade de satélites utilizados ou recebidos '
-                'pelo GPS. Em geral, mais satélites ajudam na localização, '
-                'mas a quantidade sozinha não garante precisão.'
-            )
-        }
-    }
-
-    for k, info in sensores.items():
-        if k in d.columns:
-            st.markdown(f"**{info['nome']}**")
-
-            valores = pd.to_numeric(d[k], errors='coerce')
-
-            grafico = go.Figure(
-                go.Scatter(
-                    x=d.t - d.t.min(),
-                    y=valores,
-                    mode='lines',
-                    name=info['nome'],
-                    line=dict(width=2)
-                )
-            )
-
-            grafico.update_layout(
-                height=330,
-                xaxis_title='Tempo da sessão (s)',
-                yaxis_title=info['unidade'],
-                margin=dict(t=25, b=45)
-            )
-
-            st.plotly_chart(
-                grafico,
-                use_container_width=True
-            )
-
-            st.caption(info['explicacao'])
-            st.divider()
-
-
-if __name__ == '__main__':
-    main()
